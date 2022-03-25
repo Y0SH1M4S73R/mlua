@@ -47,6 +47,9 @@ use {
 #[cfg(not(feature = "luau"))]
 use crate::{hook::HookTriggers, types::HookCallback};
 
+#[cfg(feature = "luau")]
+use crate::{types::InterruptCallback};
+
 #[cfg(feature = "async")]
 use {
     crate::types::{AsyncCallback, AsyncCallbackUpvalue, AsyncPollUpvalue},
@@ -108,6 +111,8 @@ struct ExtraData {
     hook_callback: Option<HookCallback>,
     #[cfg(feature = "lua54")]
     warn_callback: Option<WarnCallback>,
+    #[cfg(feature = "luau")]
+    interrupt_callback: Option<InterruptCallback>
 }
 
 #[cfg_attr(any(feature = "lua51", feature = "luajit"), allow(dead_code))]
@@ -548,6 +553,8 @@ impl Lua {
             hook_callback: None,
             #[cfg(feature = "lua54")]
             warn_callback: None,
+            #[cfg(feature = "luau")]
+            interrupt_callback: None,
         }));
 
         mlua_expect!(
@@ -859,6 +866,58 @@ impl Lua {
         unsafe {
             (*self.extra.get()).hook_callback = None;
             ffi::lua_sethook(state, None, 0, 0);
+        }
+    }
+
+    #[cfg(feature = "luau")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn set_interrupt<F>(&self, callback: F) -> Result<()>
+    where
+        F: 'static + MaybeSend + FnMut(&Lua, c_int) -> Result<()>,
+    {
+        unsafe extern "C" fn interrupt_proc(state: *mut ffi::lua_State, gc: c_int) {
+            let lua = match Lua::make_from_ptr(state) {
+                Some(lua) => lua,
+                None => return,
+            };
+            let extra = lua.extra.get();
+            callback_error_ext(state, extra, move |_| {
+                let interrupt_cb = (*lua.extra.get()).interrupt_callback.clone();
+                let interrupt_cb = mlua_expect!(interrupt_cb, "no interrupt callback set in interrupt_proc");
+
+                #[allow(clippy::match_wild_err_arm)]
+                match interrupt_cb.try_lock() {
+                    Ok(mut cb) => cb(&lua, gc),
+                    Err(_) => {
+                        mlua_panic!("Lua should not allow hooks to be called within another hook")
+                    }
+                }?;
+
+                Ok(())
+            })
+        }
+
+        let state = self.main_state.ok_or(Error::MainThreadNotAvailable)?;
+        unsafe {
+            (*self.extra.get()).interrupt_callback = Some(Arc::new(Mutex::new(callback)));
+            let callbacks = ffi::lua_callbacks(state);
+            (*callbacks).interrupt = Some(interrupt_proc);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "luau")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn remove_interrupt(&self) {
+        // If main_state is not available, then set_interrupt wasn't called.
+        let state = match self.main_state {
+            Some(state) => state,
+            None => return,
+        };
+        unsafe {
+            (*self.extra.get()).interrupt_callback = None;
+            let callbacks = ffi::lua_callbacks(state);
+            (*callbacks).interrupt = None;
         }
     }
 

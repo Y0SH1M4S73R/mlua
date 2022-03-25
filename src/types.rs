@@ -61,6 +61,12 @@ pub(crate) type WarnCallback = Box<dyn Fn(&Lua, &CStr, bool) -> Result<()> + Sen
 #[cfg(all(not(feature = "send"), feature = "lua54"))]
 pub(crate) type WarnCallback = Box<dyn Fn(&Lua, &CStr, bool) -> Result<()>>;
 
+#[cfg(all(feature = "send", feature = "luau"))]
+pub(crate) type InterruptCallback = Arc<Mutex<dyn FnMut(&Lua, c_int) -> Result<()> + Send>>;
+
+#[cfg(all(not(feature = "send"), feature = "luau"))]
+pub(crate) type InterruptCallback = Arc<Mutex<dyn FnMut(&Lua, c_int) -> Result<()>>>;
+
 #[cfg(feature = "send")]
 pub trait MaybeSend: Send {}
 #[cfg(feature = "send")]
