@@ -873,9 +873,12 @@ impl Lua {
     #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
     pub fn set_interrupt<F>(&self, callback: F) -> Result<()>
     where
-        F: 'static + MaybeSend + FnMut(&Lua, c_int) -> Result<()>,
+        F: 'static + MaybeSend + FnMut(&Lua) -> Result<()>,
     {
         unsafe extern "C" fn interrupt_proc(state: *mut ffi::lua_State, gc: c_int) {
+            if gc != -1 {
+                return
+            };
             let lua = match Lua::make_from_ptr(state) {
                 Some(lua) => lua,
                 None => return,
@@ -887,7 +890,7 @@ impl Lua {
 
                 #[allow(clippy::match_wild_err_arm)]
                 match interrupt_cb.try_lock() {
-                    Ok(mut cb) => cb(&lua, gc),
+                    Ok(mut cb) => cb(&lua),
                     Err(_) => {
                         mlua_panic!("Lua should not allow hooks to be called within another hook")
                     }
