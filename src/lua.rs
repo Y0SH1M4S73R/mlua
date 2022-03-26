@@ -924,6 +924,26 @@ impl Lua {
         }
     }
 
+    #[cfg(feature = "luau")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn sandbox(&self) -> Result<()> {
+        let state = self.main_state.ok_or(Error::MainThreadNotAvailable)?;
+        unsafe {
+            ffi::luaL_sandbox(state);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "luau")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn sandbox_thread(&self) -> Result<()> {
+        let state = self.state;
+        unsafe {
+            ffi::luaL_sandboxthread(state);
+        }
+        Ok(())
+    }
+
     /// Sets the warning function to be used by Lua to emit warnings.
     ///
     /// Requires `feature = "lua54"`
