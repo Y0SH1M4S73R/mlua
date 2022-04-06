@@ -47,6 +47,9 @@ use {
 #[cfg(not(feature = "luau"))]
 use crate::{hook::HookTriggers, types::HookCallback};
 
+#[cfg(feature = "luau")]
+use crate::types::{InterruptCallback, VmState};
+
 #[cfg(feature = "async")]
 use {
     crate::types::{AsyncCallback, AsyncCallbackUpvalue, AsyncPollUpvalue},
@@ -108,6 +111,11 @@ struct ExtraData {
     hook_callback: Option<HookCallback>,
     #[cfg(feature = "lua54")]
     warn_callback: Option<WarnCallback>,
+    #[cfg(feature = "luau")]
+    interrupt_callback: Option<InterruptCallback>,
+
+    #[cfg(feature = "luau")]
+    sandboxed: bool,
 }
 
 #[cfg_attr(any(feature = "lua51", feature = "luajit"), allow(dead_code))]
@@ -204,8 +212,8 @@ impl LuaOptions {
 pub(crate) static ASYNC_POLL_PENDING: u8 = 0;
 pub(crate) static EXTRA_REGISTRY_KEY: u8 = 0;
 
-const WRAPPED_FAILURES_CACHE_SIZE: usize = 16;
-const MULTIVALUE_CACHE_SIZE: usize = 16;
+const WRAPPED_FAILURES_CACHE_SIZE: usize = 32;
+const MULTIVALUE_CACHE_SIZE: usize = 32;
 
 /// Requires `feature = "send"`
 #[cfg(feature = "send")]
@@ -231,6 +239,13 @@ impl Drop for Lua {
                     ffi::lua_pushnil(extra.ref_thread);
                     ffi::lua_replace(extra.ref_thread, extra.ref_waker_idx);
                     extra.ref_free.push(extra.ref_waker_idx);
+                }
+                #[cfg(feature = "luau")]
+                {
+                    let callbacks = ffi::lua_callbacks(self.state);
+                    let extra_ptr = (*callbacks).userdata as *mut Arc<UnsafeCell<ExtraData>>;
+                    drop(Box::from_raw(extra_ptr));
+                    (*callbacks).userdata = ptr::null_mut();
                 }
                 mlua_debug_assert!(
                     ffi::lua_gettop(extra.ref_thread) == extra.ref_stack_top
@@ -548,6 +563,10 @@ impl Lua {
             hook_callback: None,
             #[cfg(feature = "lua54")]
             warn_callback: None,
+            #[cfg(feature = "luau")]
+            interrupt_callback: None,
+            #[cfg(feature = "luau")]
+            sandboxed: false,
         }));
 
         mlua_expect!(
@@ -575,6 +594,14 @@ impl Lua {
             "stack leak during creation"
         );
         assert_stack(main_state, ffi::LUA_MINSTACK);
+
+        // Set Luau callbacks userdata to extra data
+        // We can use global callbacks userdata since we don't allow C modules in Luau
+        #[cfg(feature = "luau")]
+        {
+            let extra_raw = Box::into_raw(Box::new(Arc::clone(&extra)));
+            (*ffi::lua_callbacks(main_state)).userdata = extra_raw as *mut c_void;
+        }
 
         Lua {
             state,
@@ -696,32 +723,6 @@ impl Lua {
         Ok(())
     }
 
-    /// Consumes and leaks `Lua` object, returning a static reference `&'static Lua`.
-    ///
-    /// This function is useful when the `Lua` object is supposed to live for the remainder
-    /// of the program's life.
-    /// In particular in asynchronous context this will allow to spawn Lua tasks to execute
-    /// in background.
-    ///
-    /// Dropping the returned reference will cause a memory leak. If this is not acceptable,
-    /// the reference should first be wrapped with the [`Lua::from_static`] function producing a `Lua`.
-    /// This `Lua` object can then be dropped which will properly release the allocated memory.
-    ///
-    /// [`Lua::from_static`]: #method.from_static
-    #[doc(hidden)]
-    pub fn into_static(self) -> &'static Self {
-        Box::leak(Box::new(self))
-    }
-
-    /// Constructs a `Lua` from a static reference to it.
-    ///
-    /// # Safety
-    /// This function is unsafe because improper use may lead to memory problems or undefined behavior.
-    #[doc(hidden)]
-    pub unsafe fn from_static(lua: &'static Lua) -> Self {
-        *Box::from_raw(lua as *const Lua as *mut Lua)
-    }
-
     // Executes module entrypoint function, which returns only one Value.
     // The returned value then pushed onto the stack.
     #[doc(hidden)]
@@ -776,6 +777,60 @@ impl Lua {
         self.entrypoint(move |lua, _: ()| func(lua))
     }
 
+    /// Enables (or disables) sandbox mode on this Lua instance.
+    ///
+    /// This method, in particular:
+    /// - Set all libraries to read-only
+    /// - Set all builtin metatables to read-only
+    /// - Set globals to read-only (and activates safeenv)
+    /// - Setup local environment table that performs writes locally and proxies reads
+    ///   to the global environment.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use mlua::{Lua, Result};
+    /// # fn main() -> Result<()> {
+    /// let lua = Lua::new();
+    ///
+    /// lua.sandbox(true)?;
+    /// lua.load("var = 123").exec()?;
+    /// assert_eq!(lua.globals().get::<_, u32>("var")?, 123);
+    ///
+    /// // Restore the global environment (clear changes made in sandbox)
+    /// lua.sandbox(false)?;
+    /// assert_eq!(lua.globals().get::<_, Option<u32>>("var")?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Requires `feature = "luau"`
+    #[cfg(feature = "luau")]
+    pub fn sandbox(&self, enabled: bool) -> Result<()> {
+        unsafe {
+            let extra = &mut *self.extra.get();
+            if extra.sandboxed != enabled {
+                let state = self.main_state.ok_or(Error::MainThreadNotAvailable)?;
+                check_stack(state, 3)?;
+                protect_lua!(state, 0, 0, |state| {
+                    if enabled {
+                        ffi::luaL_sandbox(state, 1);
+                        ffi::luaL_sandboxthread(state);
+                    } else {
+                        // Restore original `LUA_GLOBALSINDEX`
+                        self.ref_thread_exec(|ref_thread| {
+                            ffi::lua_xpush(ref_thread, state, ffi::LUA_GLOBALSINDEX);
+                            ffi::lua_replace(state, ffi::LUA_GLOBALSINDEX);
+                        });
+                        ffi::luaL_sandbox(state, 0);
+                    }
+                })?;
+                extra.sandboxed = enabled;
+            }
+            Ok(())
+        }
+    }
+
     /// Sets a 'hook' function that will periodically be called as Lua code executes.
     ///
     /// When exactly the hook function is called depends on the contents of the `triggers`
@@ -813,7 +868,7 @@ impl Lua {
     #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
     pub fn set_hook<F>(&self, triggers: HookTriggers, callback: F) -> Result<()>
     where
-        F: 'static + MaybeSend + FnMut(&Lua, Debug) -> Result<()>,
+        F: 'static + MaybeSend + Fn(&Lua, Debug) -> Result<()>,
     {
         unsafe extern "C" fn hook_proc(state: *mut ffi::lua_State, ar: *mut ffi::lua_Debug) {
             let lua = match Lua::make_from_ptr(state) {
@@ -825,29 +880,24 @@ impl Lua {
                 let debug = Debug::new(&lua, ar);
                 let hook_cb = (*lua.extra.get()).hook_callback.clone();
                 let hook_cb = mlua_expect!(hook_cb, "no hook callback set in hook_proc");
-
-                #[allow(clippy::match_wild_err_arm)]
-                match hook_cb.try_lock() {
-                    Ok(mut cb) => cb(&lua, debug),
-                    Err(_) => {
-                        mlua_panic!("Lua should not allow hooks to be called within another hook")
-                    }
-                }?;
-
-                Ok(())
+                if Arc::strong_count(&hook_cb) > 2 {
+                    return Ok(()); // Don't allow recursion
+                }
+                hook_cb(&lua, debug)
             })
         }
 
         let state = self.main_state.ok_or(Error::MainThreadNotAvailable)?;
         unsafe {
-            (*self.extra.get()).hook_callback = Some(Arc::new(Mutex::new(callback)));
+            (*self.extra.get()).hook_callback = Some(Arc::new(callback));
             ffi::lua_sethook(state, Some(hook_proc), triggers.mask(), triggers.count());
         }
         Ok(())
     }
 
-    /// Remove any hook previously set by `set_hook`. This function has no effect if a hook was not
-    /// previously set.
+    /// Removes any hook previously set by `set_hook`.
+    ///
+    /// This function has no effect if a hook was not previously set.
     #[cfg(not(feature = "luau"))]
     #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
     pub fn remove_hook(&self) {
@@ -859,6 +909,102 @@ impl Lua {
         unsafe {
             (*self.extra.get()).hook_callback = None;
             ffi::lua_sethook(state, None, 0, 0);
+        }
+    }
+
+    /// Sets an 'interrupt' function that will periodically be called by Luau VM.
+    ///
+    /// Any Luau code is guaranteed to call this handler "eventually"
+    /// (in practice this can happen at any function call or at any loop iteration).
+    ///
+    /// The provided interrupt function can error, and this error will be propagated through
+    /// the Luau code that was executing at the time the interrupt was triggered.
+    /// Also this can be used to implement continuous execution limits by instructing Luau VM to yield
+    /// by returning [`VmState::Yield`].
+    ///
+    /// This is similar to [`Lua::set_hook`] but in more simplified form.
+    ///
+    /// # Example
+    ///
+    /// Periodically yield Luau VM to suspend execution.
+    ///
+    /// ```
+    /// # use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+    /// # use mlua::{Lua, Result, ThreadStatus, VmState};
+    /// # fn main() -> Result<()> {
+    /// let lua = Lua::new();
+    /// let count = Arc::new(AtomicU64::new(0));
+    /// lua.set_interrupt(move |_lua| {
+    ///     if count.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
+    ///         return Ok(VmState::Yield);
+    ///     }
+    ///     Ok(VmState::Continue)
+    /// });
+    ///
+    /// let co = lua.create_thread(
+    ///     lua.load(r#"
+    ///         local b = 0
+    ///         for _, x in ipairs({1, 2, 3}) do b += x end
+    ///     "#)
+    ///     .into_function()?,
+    /// )?;
+    /// while co.status() == ThreadStatus::Resumable {
+    ///     co.resume(())?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "luau")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn set_interrupt<F>(&self, callback: F)
+    where
+        F: 'static + MaybeSend + Fn(&Lua) -> Result<VmState>,
+    {
+        unsafe extern "C" fn interrupt_proc(state: *mut ffi::lua_State, gc: c_int) {
+            if gc != -1 {
+                // We don't support GC interrupts since they cannot survive Lua exceptions
+                return;
+            }
+            // TODO: think about not using drop types here
+            let lua = match Lua::make_from_ptr(state) {
+                Some(lua) => lua,
+                None => return,
+            };
+            let extra = lua.extra.get();
+            let result = callback_error_ext(state, extra, move |_| {
+                let interrupt_cb = (*extra).interrupt_callback.clone();
+                let interrupt_cb =
+                    mlua_expect!(interrupt_cb, "no interrupt callback set in interrupt_proc");
+                if Arc::strong_count(&interrupt_cb) > 2 {
+                    return Ok(VmState::Continue); // Don't allow recursion
+                }
+                interrupt_cb(&lua)
+            });
+            match result {
+                VmState::Continue => {}
+                VmState::Yield => {
+                    ffi::lua_yield(state, 0);
+                }
+            }
+        }
+
+        let state = mlua_expect!(self.main_state, "Luau should always has main state");
+        unsafe {
+            (*self.extra.get()).interrupt_callback = Some(Arc::new(callback));
+            (*ffi::lua_callbacks(state)).interrupt = Some(interrupt_proc);
+        }
+    }
+
+    /// Removes any 'interrupt' previously set by `set_interrupt`.
+    ///
+    /// This function has no effect if an 'interrupt' was not previously set.
+    #[cfg(feature = "luau")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn remove_interrupt(&self) {
+        let state = mlua_expect!(self.main_state, "Luau should always has main state");
+        unsafe {
+            (*self.extra.get()).interrupt_callback = None;
+            (*ffi::lua_callbacks(state)).interrupt = None;
         }
     }
 
@@ -1450,7 +1596,11 @@ impl Lua {
         &'lua self,
         func: Function<'lua>,
     ) -> Result<Thread<'lua>> {
-        #[cfg(any(feature = "lua54", all(feature = "luajit", feature = "vendored")))]
+        #[cfg(any(
+            feature = "lua54",
+            all(feature = "luajit", feature = "vendored"),
+            feature = "luau",
+        ))]
         unsafe {
             let _sg = StackGuard::new(self.state);
             check_stack(self.state, 1)?;
@@ -1460,6 +1610,14 @@ impl Lua {
                 let thread_state = ffi::lua_tothread(extra.ref_thread, index);
                 self.push_ref(&func.0);
                 ffi::lua_xmove(self.state, thread_state, 1);
+
+                #[cfg(feature = "luau")]
+                {
+                    // Inherit `LUA_GLOBALSINDEX` from the caller
+                    ffi::lua_xpush(self.state, thread_state, ffi::LUA_GLOBALSINDEX);
+                    ffi::lua_replace(thread_state, ffi::LUA_GLOBALSINDEX);
+                }
+
                 return Ok(Thread(LuaRef { lua: self, index }));
             }
         };
@@ -1468,7 +1626,11 @@ impl Lua {
 
     /// Resets thread (coroutine) and returns to the cache for later use.
     #[cfg(feature = "async")]
-    #[cfg(any(feature = "lua54", all(feature = "luajit", feature = "vendored")))]
+    #[cfg(any(
+        feature = "lua54",
+        all(feature = "luajit", feature = "vendored"),
+        feature = "luau",
+    ))]
     pub(crate) unsafe fn recycle_thread(&self, thread: &mut Thread) {
         let extra = &mut *self.extra.get();
         let thread_state = ffi::lua_tothread(extra.ref_thread, thread.0.index);
@@ -2619,105 +2781,11 @@ impl Lua {
         Ok(())
     }
 
-    #[cfg(feature = "luau")]
-    unsafe fn prepare_luau_state(&self) -> Result<()> {
-        use std::ffi::CStr;
-
-        // Since Luau has some missing standard function, we re-implement them here
-
-        unsafe extern "C" fn lua_collectgarbage(state: *mut ffi::lua_State) -> c_int {
-            let option = ffi::luaL_optstring(state, 1, cstr!("collect"));
-            let option = CStr::from_ptr(option);
-            match option.to_str() {
-                Ok("collect") => {
-                    ffi::lua_gc(state, ffi::LUA_GCCOLLECT, 0);
-                    0
-                }
-                Ok("count") => {
-                    let n = ffi::lua_gc(state, ffi::LUA_GCCOUNT, 0);
-                    ffi::lua_pushnumber(state, n as ffi::lua_Number);
-                    1
-                }
-                // TODO: More variants
-                _ => ffi::luaL_error(
-                    state,
-                    cstr!("collectgarbage must be called with 'count' or 'collect'"),
-                ),
-            }
-        }
-
-        fn lua_require(lua: &Lua, name: Option<std::string::String>) -> Result<Value> {
-            let name = name.ok_or_else(|| Error::RuntimeError("name is nil".into()))?;
-
-            // Find module in the cache
-            let loaded = unsafe {
-                let _sg = StackGuard::new(lua.state);
-                check_stack(lua.state, 2)?;
-                protect_lua!(lua.state, 0, 1, fn(state) {
-                    ffi::luaL_getsubtable(state, ffi::LUA_REGISTRYINDEX, cstr!("_LOADED"));
-                })?;
-                Table(lua.pop_ref())
-            };
-            if let Some(v) = loaded.raw_get(name.clone())? {
-                return Ok(v);
-            }
-
-            // Load file from filesystem
-            let mut search_path = std::env::var("LUAU_PATH").unwrap_or_default();
-            if search_path.is_empty() {
-                search_path = "?.luau;?.lua".into();
-            }
-
-            let mut source = None;
-            for path in search_path.split(';') {
-                if let Ok(buf) = std::fs::read(path.replacen('?', &name, 1)) {
-                    source = Some(buf);
-                    break;
-                }
-            }
-            let source =
-                source.ok_or_else(|| Error::RuntimeError(format!("cannot find '{}'", name)))?;
-
-            let value = lua
-                .load(&source)
-                .set_name(&format!("={}", name))?
-                .set_mode(ChunkMode::Text)
-                .call::<_, Value>(())?;
-
-            // Save in the cache
-            loaded.raw_set(
-                name,
-                match value.clone() {
-                    Value::Nil => Value::Boolean(true),
-                    v => v,
-                },
-            )?;
-
-            Ok(value)
-        }
-
-        let globals = self.globals();
-        globals.raw_set(
-            "collectgarbage",
-            self.create_c_function(lua_collectgarbage)?,
-        )?;
-        globals.raw_set("require", self.create_function(lua_require)?)?;
-
-        Ok(())
-    }
-
     pub(crate) unsafe fn make_from_ptr(state: *mut ffi::lua_State) -> Option<Self> {
         let _sg = StackGuard::new(state);
         assert_stack(state, 1);
 
-        let extra_key = &EXTRA_REGISTRY_KEY as *const u8 as *const c_void;
-        if ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, extra_key) != ffi::LUA_TUSERDATA {
-            return None;
-        }
-        let extra_ptr = ffi::lua_touserdata(state, -1) as *mut Arc<UnsafeCell<ExtraData>>;
-        let extra = Arc::clone(&*extra_ptr);
-        ffi::lua_pop(state, 1);
-
+        let extra = extra_data(state)?;
         let safe = (*extra.get()).safe;
         Some(Lua {
             state,
@@ -2747,6 +2815,27 @@ impl Lua {
             }
         }
     }
+}
+
+#[cfg(feature = "luau")]
+unsafe fn extra_data(state: *mut ffi::lua_State) -> Option<Arc<UnsafeCell<ExtraData>>> {
+    let extra_ptr = (*ffi::lua_callbacks(state)).userdata as *mut Arc<UnsafeCell<ExtraData>>;
+    if extra_ptr.is_null() {
+        return None;
+    }
+    Some(Arc::clone(&*extra_ptr))
+}
+
+#[cfg(not(feature = "luau"))]
+unsafe fn extra_data(state: *mut ffi::lua_State) -> Option<Arc<UnsafeCell<ExtraData>>> {
+    let extra_key = &EXTRA_REGISTRY_KEY as *const u8 as *const c_void;
+    if ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, extra_key) != ffi::LUA_TUSERDATA {
+        return None;
+    }
+    let extra_ptr = ffi::lua_touserdata(state, -1) as *mut Arc<UnsafeCell<ExtraData>>;
+    let extra = Arc::clone(&*extra_ptr);
+    ffi::lua_pop(state, 1);
+    Some(extra)
 }
 
 // Creates required entries in the metatable cache (see `util::METATABLE_CACHE`)
