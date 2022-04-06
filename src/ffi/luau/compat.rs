@@ -291,7 +291,6 @@ pub unsafe fn lua_resume(
 // lauxlib ported functions
 //
 
-#[inline(always)]
 pub unsafe fn luaL_checkstack(L: *mut lua_State, sz: c_int, msg: *const c_char) {
     if lua_checkstack(L, sz + LUA_MINSTACK) == 0 {
         if !msg.is_null() {
